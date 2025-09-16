@@ -143,46 +143,11 @@ async def retry_send(func, *args, **kwargs):
             return await func(*args, **kwargs)
         except Exception as e:
             if is_blocked_error(e):
-                # повторно не намагаємось, піднімаємо помилку вище для обробки
                 raise
             logger.warning(f"Помилка (спроба {attempt}/{max_attempts}): {e}")
             sleep_s = base_sleep * (2 ** (attempt - 1))
             await asyncio.sleep(min(sleep_s, 10))
     raise RuntimeError("Вичерпано спроби відправки у Telegram")
-
-async def safe_send_message(chat: Chat, text: str, **kwargs):
-    """
-    Для aiotg: правильний метод відправки тексту — chat.send_text(...)
-    kwargs можуть містити parse_mode, disable_web_page_preview тощо.
-    """
-    return await retry_send(chat.send_text, text, **kwargs)
-
-async def safe_send_media_group(chat: Chat, media: List[Dict[str, Any]], **kwargs):
-    """
-    aiotg не має send_media_group — відправляємо файли по одному.
-    Підтримуємо фото (chat.send_photo). Якщо media['media'] — BytesIO, дивимось що робити.
-    Повертаємо список результатів (один результат — для кожного виклику send_photo).
-    """
-    results = []
-    for idx, m in enumerate(media):
-        try:
-            if m.get("type") == "photo":
-                media_obj = m.get("media")
-                # Якщо BytesIO — переконаємось, що вказано початок
-                if isinstance(media_obj, BytesIO):
-                    media_obj.seek(0)
-                # Першому фото можемо додати caption/parse_mode
-                caption = m.get("caption")
-                parse_mode = m.get("parse_mode")
-                # Виклик chat.send_photo — aiotg приймає (photo, caption=..., parse_mode=...)
-                res = await retry_send(chat.send_photo, media_obj, caption=caption, parse_mode=parse_mode)
-                results.append(res)
-            else:
-                logger.warning(f"Непідтримуваний тип медіа: {m.get('type')}")
-        except Exception as e:
-            # Якщо помилка — лог і продовжуємо з наступним
-            logger.error(f"Не вдалося відправити медіа #{idx}: {e}")
-    return results
 
 # ---------------- ОБРОБНИКИ КОМАНД ----------------
 @bot.command(r"/start(?:\s+(.+))?")
@@ -190,7 +155,7 @@ async def handle_start(chat: Chat, match):
     try:
         db_data = await read_db()
         if db_data is None:
-            await safe_send_message(chat, "❌ Не вдалося прочитати БД. Спробуйте пізніше.")
+            await retry_send(chat.send_text, "❌ Не вдалося прочитати БД. Спробуйте пізніше.")
             return
 
         chat_id = chat.id
@@ -198,15 +163,15 @@ async def handle_start(chat: Chat, match):
         activation_id = match.group(1) if match and match.group(1) else None
 
         if active_user and not activation_id:
-            await safe_send_message(chat, f"👋 Вітаю, {active_user.get('nickname', 'друже')}! Ваш акаунт вже прив'язаний та активний.")
+            await retry_send(chat.send_text, f"👋 Вітаю, {active_user.get('nickname', 'друже')}! Ваш акаунт вже прив'язаний та активний.")
             return
 
         if not activation_id:
-            await safe_send_message(chat, "Для активації, будь ласка, використайте персональне посилання з вашого кабінету.")
+            await retry_send(chat.send_text, "Для активації, будь ласка, використайте персональне посилання з вашого кабінету.")
             return
 
         if active_user:
-            await safe_send_message(chat, "Цей Telegram акаунт вже прив'язаний до профілю. Ви не можете активувати інший код.")
+            await retry_send(chat.send_text, "Цей Telegram акаунт вже прив'язаний до профілю. Ви не можете активувати інший код.")
             return
 
         user_to_activate = None
@@ -220,16 +185,15 @@ async def handle_start(chat: Chat, match):
             binding = user_to_activate.setdefault("telegramBinding", {})
             binding["status"] = "active"
             binding["chatId"] = chat_id
-            # chat.sender — aiotg надає .sender з даними користувача
             binding["username"] = (getattr(chat, "sender", {}) or {}).get("username")
 
             if await write_db(db_data):
-                await safe_send_message(chat, f"✅ Вітаю, {user_to_activate.get('nickname', '')}! Сповіщення успішно увімкнено.")
+                await retry_send(chat.send_text, f"✅ Вітаю, {user_to_activate.get('nickname', '')}! Сповіщення успішно увімкнено.")
                 logger.info(f"Користувач {user_to_activate.get('nickname')} (ID: {user_to_activate.get('userId')}) активував бота.")
             else:
-                await safe_send_message(chat, "❌ Сталася помилка під час збереження даних. Спробуйте пізніше.")
+                await retry_send(chat.send_text, "❌ Сталася помилка під час збереження даних. Спробуйте пізніше.")
         else:
-            await safe_send_message(chat, "❌ Недійсний або вже використаний код активації.")
+            await retry_send(chat.send_text, "❌ Недійсний або вже використаний код активації.")
             logger.warning(f"Не знайдено користувача з activation_id: {activation_id}")
 
     except Exception as e:
@@ -257,40 +221,56 @@ async def handle_notify(request: web.Request):
     if not chat_id or not event_data:
         return web.Response(status=400, text="Bad Request: Missing chat_id or event_data")
 
-    # отримуємо aiotg.Chat об'єкт
-    # Виправлення: aiotg.Bot не має методу .chat(...) — потрібно створити Chat через клас Chat
     chat = Chat(bot, chat_id)
-
     event_type = event_data.get("type")
-
+    
+    # *** ОСНОВНІ ЗМІНИ ТУТ ***
     try:
+        # Обробка фотографій
         if event_type == "photos":
             caption = (
                 "📸 **Нові фото!**\n\n"
                 f"**Пристрій:** `{event_data.get('fingerprint','-')}`\n"
                 f"**Час:** `{event_data.get('collectedAt','-')}`"
             )
-            media = []
-            for idx, photo_b64 in enumerate(event_data.get("data", [])[:10]):  # до 10 фото у групі
+            # Відправляємо фото по одному, щоб уникнути проблем з media group
+            for idx, photo_b64 in enumerate(event_data.get("data", [])[:10]):
                 try:
-                    payload = photo_b64
-                    if "," in payload:
-                        payload = payload.split(",", 1)[1]
-                    photo_bytes = base64.b64decode(payload, validate=True)
+                    payload = photo_b64.split(",", 1)[1] if "," in photo_b64 else photo_b64
+                    photo_bytes = base64.b64decode(payload)
                     fh = BytesIO(photo_bytes)
-                    fh.seek(0)
-                    media.append({
-                        "type": "photo",
-                        "media": fh,
-                        "caption": caption if idx == 0 else None,
-                        "parse_mode": "Markdown" if idx == 0 else None
-                    })
+                    await retry_send(
+                        chat.send_photo,
+                        photo=fh,
+                        caption=caption if idx == 0 else None,
+                        parse_mode="Markdown" if idx == 0 else None
+                    )
                 except Exception as e:
-                    logger.error(f"Не вдалося декодувати фото #{idx}: {e}")
+                    logger.error(f"Не вдалося декодувати або відправити фото #{idx}: {e}")
+        
+        # Обробка ВІДЕО (НОВИЙ БЛОК)
+        elif event_type == "video":
+            caption = (
+                "📹 **Нове відео!**\n\n"
+                f"**Пристрій:** `{event_data.get('fingerprint','-')}`\n"
+                f"**Час:** `{event_data.get('collectedAt','-')}`"
+            )
+            for idx, video_b64 in enumerate(event_data.get("data", [])[:10]):
+                try:
+                    payload = video_b64.split(",", 1)[1] if "," in video_b64 else video_b64
+                    video_bytes = base64.b64decode(payload)
+                    fh = BytesIO(video_bytes)
+                    fh.name = f"video_{idx+1}.webm"  # Telegram'у може знадобитися ім'я файлу
+                    await retry_send(
+                        chat.send_video,
+                        video=fh,
+                        caption=caption if idx == 0 else None,
+                        parse_mode="Markdown" if idx == 0 else None
+                    )
+                except Exception as e:
+                    logger.error(f"Не вдалося декодувати або відправити відео #{idx}: {e}")
 
-            if media:
-                await safe_send_media_group(chat, media)
-
+        # Обробка геолокації
         elif event_type == "location":
             lat = event_data.get("data", {}).get("latitude")
             lon = event_data.get("data", {}).get("longitude")
@@ -303,8 +283,9 @@ async def handle_notify(request: web.Request):
                 f"**Координати:** `{lat}, {lon}`\n\n"
                 f"[Відкрити на карті]({maps_link})"
             )
-            await safe_send_message(chat, message_text, parse_mode="Markdown", disable_web_page_preview=True)
+            await retry_send(chat.send_text, message_text, parse_mode="Markdown", disable_web_page_preview=True)
 
+        # Обробка даних з форми
         elif event_type == "form":
             form_id = event_data.get("formId", "-")
             fields = "\n".join(
@@ -317,10 +298,23 @@ async def handle_notify(request: web.Request):
                 f"**Пристрій:** `{event_data.get('fingerprint','-')}`\n\n"
                 f"{fields}"
             )
-            await safe_send_message(chat, message_text, parse_mode="Markdown")
+            await retry_send(chat.send_text, message_text, parse_mode="Markdown")
+            
+        # Обробка інформації про пристрій (НОВИЙ БЛОК)
+        elif event_type == "device_info":
+            info_items = [f"- **{key}:** `{value}`" 
+                          for key, value in (event_data.get("data") or {}).items()]
+            info_text = "\n".join(info_items) or "_(немає даних)_"
+            message_text = (
+                "ℹ️ **Інформація про пристрій**\n\n"
+                f"**Відбиток (FP):** `{event_data.get('fingerprint','-')}`\n"
+                f"**Час:** `{event_data.get('collectedAt','-')}`\n\n"
+                f"{info_text}"
+            )
+            await retry_send(chat.send_text, message_text, parse_mode="Markdown")
 
         else:
-            logger.warning(f"Невідомий тип події: {event_type}")
+            logger.warning(f"Отримано невідомий тип події: {event_type}. Дані: {event_data}")
 
     except Exception as e:
         logger.error(f"Помилка при відправці сповіщення для chat_id {chat_id}: {e}")
@@ -332,6 +326,7 @@ async def handle_notify(request: web.Request):
                 if user_to_deactivate and user_to_deactivate.get("telegramBinding", {}).get("status") != 'bot_blocked':
                     user_to_deactivate["telegramBinding"]["status"] = 'bot_blocked'
                     await write_db(db_data)
+                    
     return web.Response(status=200, text="OK")
 
 async def handle_health_check(request: web.Request):
@@ -341,7 +336,6 @@ async def handle_health_check(request: web.Request):
 async def keep_alive():
     while True:
         try:
-            # bot.get_me() у aiotg — корутина
             await bot.get_me()
             logger.info("Ping до Telegram успішний")
         except Exception as e:
@@ -361,7 +355,7 @@ async def main():
     logger.info(f"Веб-сервер запущено на порту {PORT}")
 
     asyncio.create_task(keep_alive())
-    await bot.loop()  # Запускаємо aiotg бота (асинхронний loop)
+    await bot.loop()
 
 if __name__ == "__main__":
     try:
